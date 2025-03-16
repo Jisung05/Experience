@@ -1,0 +1,975 @@
+---
+title: "Untitled"
+author: "Jisung"
+date: "2024-12-04"
+output: html_document
+---
+
+#1. Load Library
+```{r}
+library(tidyverse)
+library(magrittr)
+library(data.table)
+library(ggpubr)
+library(caret)
+library(Metrics)
+library(readxl)
+library(writexl)
+library(matrixsampling)
+library(invgamma)
+library(progress)
+library(MASS)
+library(MCMCpack)
+```
+
+```{r}
+#!이 부분의 값만 1씩 늘려가며 바꿔주시면 됩니다! 
+name <- 1
+```
+
+##a. True value 지정 
+```{r}
+#fixed도 1개씩, random도 1개씩 
+t_alpha <- matrix(c(0.5),ncol=1)
+t_beta<-matrix(c(0.8),ncol=1)
+t_k=1
+
+t_Sigma_1 <- 1
+t_Sigma_2 <- 1
+t_Rho <- 0.5
+```
+
+##b. covariate 개수 지정 
+```{r}
+#생성할 각 covariate의 개수 
+p_alpha<-1
+q_ai <- 1
+p_beta <- 1
+q_bi <- 1 
+
+target <- c(10,11,12)
+
+target_trans <- target+1 #음이항 분포 평균에서 beta분포 활용 
+```
+
+##c.계산을 위한 함수 정의 
+```{r}
+#1. col_num : 변수의 이름에 따라 열 번호를 추출하는 방식을 함수화 
+col_num <- function(data,vari_name){
+  vari_num <- which(names(data) %in% vari_name)
+  return(vari_num)
+}
+
+#2. p_cal : data simulation에서 inflated value에 속하지 않을 확률 계산 
+p_cal <- function(row,t_alpha){
+  
+  alpha <- matrix(t_alpha, nrow=p_alpha)
+  X <- matrix(row[col_num(simul_data,name_X_alpha)], ncol = p_alpha)
+  Z <- matrix(row[col_num(simul_data, name_Z_a)], ncol=q_ai)
+  a_i <- matrix(row[col_num(simul_data,ai_index)], nrow = q_ai)
+  
+  #return(exp(X%*%alpha+Z%*%a_i)/(1+exp(X%*%alpha+Z%*%a_i)))
+  return(1/(1/exp(X%*%alpha+Z%*%a_i)+1))
+}
+
+#3. lam_cal : data simulation에서 inflated value에 속하지 않을 때 underlying mean 계산 
+lam_cal <- function(row,t_beta){
+  
+  beta <-matrix(t_beta, nrow=p_beta)
+  X <- matrix(row[col_num(simul_data,name_X_beta)], ncol = p_beta)
+  Z <- matrix(row[col_num(simul_data, name_Z_b)], ncol=q_bi)
+  b_i <- matrix(row[col_num(simul_data,bi_index)], nrow = q_bi)
+  
+  return(exp(X%*%beta+Z%*%b_i))
+}
+
+#4. func_exp : exp(X+Z) 꼴에 대한 계산 
+func_exp <- function(X, fixed, Z, random){
+  return(exp(X %*% fixed + Z %*% random))
+}
+
+#5. func_nb : 음이항 분포의 pmf 
+func_nb <- function(X_beta, beta, Z_b, b_i, y,k){
+  
+  func_beta <- func_exp(X_beta, beta ,Z_b, b_i)
+  result <- 1/(y*beta(y,1/k))*(k/(1/func_beta+k))^y*(1/(1+k*func_beta))^(1/k)
+  return(result)
+}
+
+#6. common_part : full_posterior에서 모든 parameter에 대한 공통된 부분  
+common_part <- function(row, alpha, beta, k){
+  r <- as.numeric(row[col_num(dt_apply,"r")])
+  if(r==1){
+    result=0
+  } else {
+    alpha <- matrix(alpha, nrow=p_alpha) 
+    beta <- matrix(beta, nrow=p_beta)
+  
+    X_alpha <- matrix(row[col_num(dt_apply ,name_X_alpha)], ncol = p_alpha)
+    Z_a<- matrix(row[col_num(dt_apply ,name_Z_a)], ncol = q_ai)
+    X_beta <- matrix(row[col_num(dt_apply ,name_X_beta)],ncol=p_beta)
+    Z_b <- matrix(row[col_num(dt_apply ,name_Z_b)],ncol=q_bi)
+    y <- as.numeric(row[col_num(dt_apply ,"Y_trans")])
+    a_i <- matrix(row[col_num(dt_apply ,ai_index)],nrow=q_ai) #trace 적용 안하려고 ncol = 1로 설정 
+    b_i <-  matrix(row[col_num(dt_apply,bi_index)],nrow=q_bi) #trace 적용 안하려고 ncol = 1로 설정 
+    func_alpha <- func_exp(X_alpha, alpha ,Z_a, a_i)
+    
+    cal_nb <- func_nb(X_beta, beta, Z_b, b_i,y,k)
+    result <- log((1/(1+func_alpha))/length(target)+(1/(1/(func_alpha)+1))*cal_nb)
+  }
+  return(result)
+}
+
+#7. alpha-part : alpha의 full_posterior에서 필요한 계산 
+alpha_part <- function(row, alpha){
+  r <- as.numeric(row[col_num(dt_apply,"r")])
+  if(r==0){
+    result = 0 
+  } else {
+    alpha<- matrix(alpha,nrow=p_alpha)
+    X_alpha <- matrix(row[col_num(dt_apply,name_X_alpha)], ncol = p_alpha)
+    Z_a<- matrix(row[col_num(dt_apply,name_Z_a)], ncol = q_ai)
+    a_i <- matrix(row[col_num(dt_apply,ai_index)],nrow=q_ai)
+    
+    func_alpha <- func_exp(X_alpha, alpha ,Z_a, a_i)
+    
+    result <- log(1/(1/func_alpha+1))
+  }
+  return(result)
+}
+
+#8. beta_part : beta의 full_posterior에서 필요한 계산  
+beta_part <- function(row,beta,k){
+  r <- as.numeric(row[col_num(dt_apply,"r")])
+  if(r==0){
+    result = 0
+  } else {
+    beta <- matrix(beta, nrow=p_beta)
+    X_beta <- matrix(row[col_num(dt_apply,name_X_beta)],ncol=p_beta)
+    Z_b <- matrix(row[col_num(dt_apply,name_Z_b)],ncol=q_bi)
+    y <- as.numeric(row[col_num(dt_apply,"Y_trans")])
+    b_i <-  matrix(row[col_num(dt_apply,bi_index)],nrow=q_bi)
+  
+    func_beta <- func_exp(X_beta, beta ,Z_b, b_i)
+  
+    result <- (y*log(k/(1/func_beta+k))+(1/k)*log(1/(1+k*func_beta)))
+  }
+  return(result)
+}
+
+#9. k_part : k의 full_posterior에서 필요한 계산 
+k_part <- function(row,beta,k) {
+  r <- as.numeric(row[col_num(dt_apply,"r")])
+  if(r==0){
+    result = 0 
+  }else{
+    beta <- matrix(beta, nrow=p_beta)
+    X_beta <- matrix(row[col_num(dt_apply,name_X_beta)],ncol=p_beta)
+    Z_b <- matrix(row[col_num(dt_apply,name_Z_b)],ncol=q_bi)
+    y <- as.numeric(row[col_num(dt_apply,"Y_trans")])
+    b_i <-  matrix(row[col_num(dt_apply,bi_index)],nrow=q_bi)
+    func_beta <- func_exp(X_beta, beta, Z_b, b_i)
+  
+    result <- (-log(beta(y,1/k))+y*log(k/(1/func_beta+k))+(1/k)*log(1/(1+k*func_beta)))
+  }
+  return(result)
+}
+
+#10. dataframe에 random effect를 붙이는 코드 
+ran_eff <- function(data, cov){
+  delta <- mvrnorm(s_nsubj, rep(0,q_ai+q_bi), cov) %>% as.data.frame()
+  s_id_uniq <- cbind(unique(s_id),delta) 
+  names(s_id_uniq)[2:(1+q_ai+q_bi)] <- random_index
+  data %<>%  left_join(s_id_uniq, by="id")
+  return(data)
+}
+
+#11. z-transformation
+z_to_rho <- function(z) {
+  return((exp(2 * z) - 1) / (exp(2 * z) + 1))
+}
+
+#12. psi matrix형태로 만들기 
+form_psi <- function(sigma1, sigma2, rho){
+  psi<-diag(c(sigma1,sigma2))%*%matrix(c(1, rho, rho, 1),nrow=2)%*%diag(c(sigma1,sigma2))
+  return(psi)
+}
+
+#13. psi_part 
+psi_part <- function(data,psi){
+  ran <- data[,col_num(data, c(ai_index, bi_index))] 
+  cal <- apply(ran, 1,function(r){-0.5*t(r)%*%ginv(psi)%*%r})
+  result <- sum(cal)
+  return(result)
+}
+
+#14. random effect part 
+random_part <- function(data,psi){
+  ran <- data[,col_num(data, c(ai_index, bi_index))] %>% unique()
+  cal <- apply(ran, 1,function(r){-0.5*t(r)%*%ginv(psi)%*%r})
+  result <- cal
+  return(result)
+}
+```
+
+##d. Simulation setting
+n_simul : 몇 개의 simulation을 돌릴 것인가?
+
+```{r}
+n_simul <- 20
+
+#random index 설정 
+random_index <- as.character(seq(1:(q_ai+q_bi)))
+ai_index <- random_index[1:q_ai] 
+bi_index <- random_index[-(1:q_ai)]
+```
+
+```{r}
+for(n in 1:n_simul){
+  
+  #id생성 
+  s_id <- data.frame(id=rep(1:100,5)) #총 데이터 1500개 생성 
+
+  #전체 데이터의 수 
+  s_nrow <- nrow(s_id)
+  s_nsubj <- n_distinct(s_id$id)
+  
+  #임의의 covariate 생성 
+  s_Xa <- NULL
+  s_Za <- NULL            
+  s_Xb <- NULL
+  s_Zb <- NULL
+
+  #Xa
+  for (i in 1:p_alpha) {
+    s_Xa <- cbind(s_Xa,rnorm(s_nrow, 1,0.5))
+  }
+  name_X_alpha <- paste("Xa", 1:p_alpha, sep = "_")
+  
+  #Za
+  s_Za<-rep(c(1,2,3,4,5), each = s_nsubj)
+  name_Z_a <- paste("Za", 1:q_ai, sep = "_")
+  
+  #Xb
+  for (i in 1:p_beta) {
+    s_Xb <- cbind(s_Xb,rnorm(s_nrow, 1,0.5))
+  }
+  name_X_beta <- paste("Xb", 1:p_beta, sep = "_")
+
+  #Zb
+  s_Zb<-rep(c(1,2,3,4,5), each = s_nsubj)
+  name_Z_b <- paste("Zb", 1:q_bi, sep = "_")
+  
+  #중간 dataframe생성 
+  simul_data <- cbind(s_id, s_Xa, s_Za, s_Xb, s_Zb)
+  names(simul_data)[-1] <- c(name_X_alpha, name_Z_a, name_X_beta, name_Z_b)
+  
+  #random effect 추출 
+  t_psi <- form_psi(t_Sigma_1,t_Sigma_2, t_Rho) #t_psi에 대한 정의 
+  simul_data <- ran_eff(simul_data,t_psi) #random effect 붙이기 
+  
+  #prob.와 mean.계산 
+  simul_data$p.v <- apply(simul_data, 1, p_cal,t_alpha)
+  simul_data $lam.v <- apply(simul_data, 1, lam_cal, t_beta)
+  
+  for (i in 1:s_nrow){
+    simul_data$r[i]=rbinom(1,1,prob=simul_data$p.v[i]) #Occurrence Variable 부여 
+  
+    if(simul_data$r[i]==0){ #Inflated된 경우, 지정한 inflated value부여 
+      simul_data$Y[i]=sample(target, size = 1, prob = c(0.3,0.3,0.4), replace = TRUE)
+    }
+    else {simul_data$Y[i]=rnbinom(1, mu=simul_data$lam.v[i], size = 1/t_k)} 
+  }
+  
+  simul_data <- simul_data[c('id', name_X_alpha, name_Z_a, name_X_beta, name_Z_b, 'r', 'Y')]
+  
+  simul_data %<>% mutate(Y_trans = Y+1) %>% relocate(Y_trans, .after=Y) 
+  
+  #데이터 저장 
+  write_xlsx(simul_data, paste0("simul_data_",20*(name-1)+n,".xlsx"))
+  #(name-1)*10+n
+  #MCMC iteration 준비 
+
+  #1. 전체 iteration 값 설정 
+  n.iter <-10000 #iteration 수 
+  m <- 1 #chain의 개수 (multiple chain : 이후 convergence 확인 위하여)
+  
+  #2. 추정 parameter 빈 공간 생성 
+  alpha<- array(NA, dim=c(p_alpha, n.iter, m)) # alpha : p_alpha*1 차원 
+  beta <- array(NA, dim=c(p_beta, n.iter, m)) # beta : p_beta*1 차원 
+  k <- array(NA, dim=c(n.iter, m)) 
+  
+  Omega<- array(NA, dim=c(1, n.iter,m)) #correlation 회귀 계수 
+  Rho <- array(NA, dim=c(n.iter,m)) #correlation part 
+  Sigma_1 <- array(NA, dim=c(n.iter,m))
+  Sigma_2 <- array(NA, dim=c(n.iter,m))
+  
+  a_i <- array(NA, dim=c(s_nsubj, n.iter,m))
+  b_i <- array(NA, dim=c(s_nsubj, n.iter,m))
+  
+  #3. 초기값 설정 
+  for(h in 1:m){
+    alpha[,1,h] <- rnorm(p_alpha,0,5)
+    beta[,1,h] <- rnorm(p_beta,0,5) 
+    k[1,h] <-rlnorm(1,0,1) 
+    
+    Omega[,1,h] <- runif(1,-1,1)
+    Sigma_1[1,h] <- rlnorm(1,0,1)
+    Sigma_2[1,h] <- rlnorm(1,0,1)
+    Rho[1,h] <- z_to_rho(Omega[,1,h])
+    #rho에 대한 회귀식 : z_transform(Omega)
+  }
+
+  #4. prior 설정 
+ 
+  #for alpha & beta prior (normal)
+  mu_alpha = rep(0,p_alpha)
+  mu_beta= rep(0,p_alpha)
+  var_alpha = diag(c(10^2),p_alpha)
+  var_beta = diag(c(10^2), p_beta)
+  
+  #for k prior (log-normal)
+  k_mu = 0
+  k_var = 100
+  
+  ## Omega - normal
+  Omega_tau = diag(c(10^2), 1)
+  
+  ## Sigma - log_normal
+  Sigma_mu = 0
+  Sigma_var = 100
+  
+  #5. 부가적인 요소 설정 
+  dt_apply <- simul_data
+  init_ncol<-ncol(dt_apply)
+  
+  # Count acceptance rate 
+  accept_a=0
+  accept_b=0
+  accept_k=0
+  accept_Omega=0
+  accept_Sigma_1=0
+  accept_Sigma_2=0
+  
+  #몇 번째 simulation인지 표시 
+  cat("Simulation step :",n)
+  
+  #MCMC시작 
+  pb<-progress_bar$new(total = n.iter*m)
+
+  #iteration 
+  for (h in 1:m) {
+    
+    dt_apply <- dt_apply[,1:init_ncol] #random effect를 제외한 df구성 
+    
+    #Random effect sampling
+    init_psi <- form_psi(Sigma_1[1,h], Sigma_2[1,h], Rho[1,h])
+    dt_apply <- ran_eff(dt_apply, init_psi)
+    
+    a_i[,1,h] <- unique(dt_apply[[ai_index]])
+    b_i[,1,h] <- unique(dt_apply[[bi_index]])
+  
+    for(i in 2:n.iter){
+      
+      ##1.alpha
+      alpha_cur <- alpha[,i-1,h]
+      cal_beta <- beta[,i-1,h]
+      cal_k <- k[i-1,h]
+      
+      #jumping distribution은 normal 
+      #jumping dist의 평균은 이전 차례 sampling된 alpha의 위치를 평균으로 적용 
+      alpha_prop = NULL
+      for(j in 1:p_alpha){
+        alpha_prop[j] <- rnorm(1, alpha_cur, diag(0.4,p_alpha)) 
+        }
+        
+      alpha_num <- sum(apply(dt_apply,1, common_part,alpha_prop,cal_beta,cal_k)+apply(dt_apply,1,alpha_part,alpha_prop))
+    
+      alpha_den <- sum(apply(dt_apply,1, common_part,alpha_cur, cal_beta,cal_k)+apply(dt_apply,1,alpha_part,alpha_cur))
+    
+      num <- alpha_num+(-0.5*t(alpha_prop-mu_alpha)%*%solve(var_alpha)%*%(alpha_prop-mu_alpha))
+      
+      den <- alpha_den+(-0.5*t(alpha_cur-mu_alpha)%*%solve(var_alpha)%*%(alpha_cur-mu_alpha))
+
+      a<-min(num-den,log(1)) #probability이기에 1차원으로 도출
+      
+      u <- log(runif(1)) 
+    
+      if(u<=a){
+          alpha[,i,h] <- alpha_prop 
+          accept_a <- accept_a+1 # for acceptance rate 
+        } else {
+          alpha[,i,h] <- alpha_cur 
+        }
+    
+      ##2.beta
+      beta_cur <- beta[,i-1,h]
+      cal_alpha <- alpha[,i,h]
+      cal_k <- k[i-1,h]
+      
+      beta_prop = NULL
+      for(j in 1:p_beta){
+        beta_prop[j] <- rnorm(1, beta_cur[j], diag(0.2,p_beta)) #새로운 beta에 대한 추정
+        }
+      
+      beta_num <- sum(apply(dt_apply,1, common_part, cal_alpha, beta_prop, cal_k) + apply(dt_apply,1,beta_part, beta_prop,cal_k))
+    
+      beta_den <- sum(apply(dt_apply,1, common_part, cal_alpha, beta_cur, cal_k) + apply(dt_apply,1,beta_part, beta_cur,cal_k))
+    
+      num <- beta_num +(-0.5*t(beta_prop-mu_beta)%*%solve(var_beta)%*%(beta_prop-mu_beta))
+      
+      den <- beta_den +(-0.5*t(beta_cur-mu_beta)%*%solve(var_beta)%*%(beta_cur-mu_beta))
+      
+      a<-min(num-den,log(1))
+      
+      u <- log(runif(1)) 
+      
+      if(u<=a){
+          beta[,i,h] <- beta_prop 
+          accept_b <- accept_b+1 #for acceptance rate 
+        }else{
+          beta[,i,h] <- beta_cur
+        }
+      
+      ##3.k
+      k_cur <- k[i-1,h]
+      cal_alpha <- alpha[,i,h]
+      cal_beta <- beta[,i,h]
+      
+      #jumping distribution은 gamma  
+      c <- 8
+      k_prop<- max(0.05,rgamma(1,k_cur*c,c))
+      
+      k_num <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta, k_prop)+apply(dt_apply, 1, k_part, cal_beta, k_prop))
+    
+      k_den <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta, k_cur)+apply(dt_apply, 1, k_part, cal_beta, k_cur))
+    
+      num <- k_num + (-log(k_prop)-(log(k_prop)-k_mu)^2/(2*k_var))-log(dgamma(k_prop,k_cur*c,c))
+      den <- k_den + (-log(k_cur)-(log(k_cur)-k_mu)^2/(2*k_var))-log(dgamma(k_cur,k_prop*c,c))
+    
+      a<-min(num-den,log(1)) #k는 1차원 
+      u <- log(runif(1)) 
+      
+      if(u <=  a){
+          k[i,h] <- k_prop 
+          accept_k <- accept_k+1 #for acceptance rate 
+        }else{
+          k[i,h] <- k_cur
+        }
+      
+      ##4.Omega
+      
+      cal_alpha <- alpha[,i,h]
+      cal_beta <- beta[,i,h]
+      cal_k <- k[i,h]
+      cal_Sigma_1 <- Sigma_1[i-1,h]
+      cal_Sigma_2 <- Sigma_2[i-1,h]
+      
+      #Omega_cur, Omega_prop 지정 
+      Omega_cur <- Omega[,i-1,h]
+      Rho_cur <- Rho[i-1,h]
+      psi_cur <- form_psi(cal_Sigma_1, cal_Sigma_2, Rho_cur)
+      
+      Omega_prop <- NULL
+      for(j in 1:1){
+        Omega_prop[j] <- rnorm(1, Omega_cur[j],0.2) #Jumping distribution
+      }
+   
+      Rho_prop <-  z_to_rho(Omega_prop)
+      psi_prop <- form_psi(cal_Sigma_1, cal_Sigma_2, Rho_prop) 
+
+      Omega_num <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta, cal_k)+apply(dt_apply,1,alpha_part,cal_alpha))+psi_part(dt_apply,psi_prop)-s_nrow/2*log(1-Rho_prop^2)
+      
+      Omega_den <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta, cal_k)+apply(dt_apply,1,alpha_part,cal_alpha))+psi_part(dt_apply,psi_cur)-s_nrow/2*log(1-Rho_cur^2)
+        
+      num <- (Omega_num)+log(2/(exp(Omega_prop)+exp(-Omega_prop)))+(-0.5*t(Omega_prop)%*%solve(Omega_tau)%*%(Omega_prop))
+      den <- (Omega_den)+log(2/(exp(Omega_cur)+exp(-Omega_cur)))+(-0.5*t(Omega_cur)%*%solve(Omega_tau)%*%(Omega_cur))
+      
+      a<- min(num-den, log(1))
+      u <- log(runif(1))
+      
+      if(u <=  a){
+        Omega[,i,h] <- Omega_prop
+        Rho[i,h] <- Rho_prop 
+        accept_Omega <- accept_Omega+1 #for acceptance rate 
+        
+        }else{
+          Omega[,i,h] <- Omega_cur
+          Rho[i,h] <- Rho_cur
+        }
+    
+      ##5.Sigma1
+      
+      cal_alpha <- alpha[,i,h]
+      cal_beta <- beta[,i,h]
+      cal_k <- k[i,h]
+      cal_Rho <- Rho[i,h]
+      cal_Sigma_2 <- Sigma_2[i-1,h]
+      
+      Sigma_1_cur <- Sigma_1[i-1,h]
+      psi_cur <- form_psi(Sigma_1_cur, cal_Sigma_2,cal_Rho)
+      
+      c<-20
+      Sigma_1_prop <- NULL
+      Sigma_1_prop <- rgamma(1, Sigma_1_cur*c ,c)
+      
+      psi_prop <- form_psi(Sigma_1_prop, cal_Sigma_2, cal_Rho) 
+      
+      Sigma_1_num <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta,cal_k)+apply(dt_apply,1,alpha_part,cal_alpha))+psi_part(dt_apply,psi_prop)+(-s_nrow)*log(Sigma_1_prop)
+    
+      Sigma_1_den <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta, cal_k)+apply(dt_apply,1,alpha_part,cal_alpha))+psi_part(dt_apply,psi_cur)+(-s_nrow)*log(Sigma_1_cur)
+    
+      num <- (Sigma_1_num) + (-log(Sigma_1_prop)-(log(Sigma_1_prop)-Sigma_mu)^2/(2*Sigma_var))-log(dgamma(Sigma_1_prop, Sigma_1_cur*c,c))
+      
+      den <- (Sigma_1_den) + (-log(Sigma_1_cur)-(log(Sigma_1_cur)-Sigma_mu)^2/(2*Sigma_var))-log(dgamma(Sigma_1_cur, Sigma_1_prop*c,c))
+      
+      a<- min(num-den, log(1))
+      
+      u <- log(runif(1)) 
+      
+      if(u <=  a){
+        Sigma_1[i,h] <- Sigma_1_prop
+        accept_Sigma_1 <- accept_Sigma_1+1 #for acceptance rate 
+        
+        }else{
+          Sigma_1[i,h] <- Sigma_1_cur
+          dt_apply <- dt_apply
+        }
+      
+      ##6.Sigma2
+      
+      cal_alpha <- alpha[,i,h]
+      cal_beta <- beta[,i,h]
+      cal_k <- k[i,h]
+      cal_Rho <- Rho[i,h]
+      cal_Sigma_1 <- Sigma_1[i,h]
+      
+      Sigma_2_cur <- Sigma_2[i-1,h]
+      psi_cur <- form_psi(cal_Sigma_1, Sigma_2_cur,cal_Rho)
+      
+      c<-20
+      Sigma_2_prop <- NULL
+      Sigma_2_prop <- rgamma(1, Sigma_2_cur*c ,c)
+      
+      psi_prop <- form_psi(cal_Sigma_1, Sigma_2_prop, cal_Rho) 
+      
+      Sigma_2_num <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta,cal_k)+ apply(dt_apply,1,beta_part, cal_beta,cal_k))+psi_part(dt_apply,psi_prop)+(-s_nrow)*log(Sigma_2_prop)
+    
+      Sigma_2_den <- sum(apply(dt_apply,1, common_part, cal_alpha, cal_beta, cal_k)+ apply(dt_apply,1,beta_part, cal_beta,cal_k))+psi_part(dt_apply,psi_cur)+(-s_nrow)*log(Sigma_2_cur)
+  
+      num <-(Sigma_2_num) + (-log(Sigma_2_prop)-(log(Sigma_2_prop)-Sigma_mu)^2/(2*Sigma_var))-log(dgamma(Sigma_2_prop, Sigma_2_cur*c,c))
+      
+      den <- (Sigma_2_den) + (-log(Sigma_2_cur)-(log(Sigma_2_cur)-Sigma_mu)^2/(2*Sigma_var))-log(dgamma(Sigma_2_cur, Sigma_2_prop*c,c))
+    
+      a<- min(num-den, log(1))
+      
+      u <- log(runif(1)) 
+      
+      if(u <=  a){
+        Sigma_2[i,h] <- Sigma_2_prop
+        accept_Sigma_2 <- accept_Sigma_2+1 #for acceptance rate 
+        
+        }else{
+          Sigma_2[i,h] <- Sigma_2_cur
+        }
+      
+      ##a_i
+      cal_alpha <- alpha[,i,h]
+      cal_beta <- beta[,i,h]
+      cal_k <- k[i,h]
+      cal_Rho <- Rho[i,h]
+      cal_Sigma_1 <- Sigma_1[i,h]
+      cal_Sigma_2 <- Sigma_1[i,h]
+      
+      cal_psi <- form_psi(cal_Sigma_1, cal_Sigma_2,cal_Rho)
+      
+      for(l in 1:s_nsubj){
+        
+        ai_cur <- a_i[l,i-1,h] #a의 l번째 index current 
+        ai_prop <- rnorm(1, a_i[l,i-1,h], 0.2) #a의 l번째 index proposal
+        
+        dt_cur <- dt_apply[dt_apply$id == l,] #i index에 해당하는 값만 추출 
+        
+        dt_prop <- dt_cur
+        dt_prop[[ai_index]] <- ai_prop
+        
+        ai_num <- sum(apply(dt_prop,1, common_part, cal_alpha, cal_beta, cal_k)+
+                        apply(dt_prop,1,alpha_part, cal_alpha))
+        
+        ai_den <- sum(apply(dt_cur,1, common_part, cal_alpha ,cal_beta,cal_k)+
+                        apply(dt_cur,1,alpha_part, cal_alpha))
+        
+        num <- ai_num + (-nrow(dt_prop)/2*log(det(cal_psi))) + random_part(dt_prop, cal_psi)
+        den <- ai_den + (-nrow(dt_cur)/2*log(det(cal_psi))) + random_part(dt_cur, cal_psi)
+        
+        a<-min(num-den,log(1)) 
+        u <- log(runif(1)) 
+        
+        if(u <=  a){
+          a_i[l,i,h] <- ai_prop
+        }else{
+          a_i[l,i,h] <- ai_cur
+        }
+      }
+      
+      #새롭게 update된 random effect를 기존의 dataset과 결합 
+      delta_id <- cbind(unique(s_id), (a_i[,i,h]))
+      dt_apply$`1` <- delta_id[,2][match(dt_apply$id, delta_id$id)]
+      
+      ##b_i
+      cal_alpha <- alpha[,i,h]
+      cal_beta <- beta[,i,h]
+      cal_k <- k[i,h]
+      cal_Rho <- Rho[i,h]
+      cal_Sigma_1 <- Sigma_1[i,h]
+      cal_Sigma_2 <- Sigma_1[i,h]
+      
+      cal_psi <- form_psi(cal_Sigma_1, cal_Sigma_2,cal_Rho)
+      
+      for(l in 1:s_nsubj){
+        
+        bi_cur <- b_i[l,i-1,h] #a의 l번째 index current 
+        bi_prop <- rnorm(1, b_i[l,i-1,h], 0.2) #a의 l번째 index proposal
+        
+        dt_cur <- dt_apply[dt_apply$id == l,] #i index에 해당하는 값만 추출 
+        
+        dt_prop <- dt_cur
+        dt_prop[[bi_index]] <- bi_prop
+        
+        bi_num <- sum(apply(dt_prop,1, common_part, cal_alpha, cal_beta, cal_k)+
+                        apply(dt_prop,1,beta_part, cal_beta, cal_k))
+        
+        bi_den <- sum(apply(dt_cur,1, common_part, cal_alpha ,cal_beta,cal_k)+
+                        apply(dt_cur,1,beta_part, cal_beta, cal_k))
+        
+        num <- bi_num + (-nrow(dt_prop)/2*log(det(cal_psi))) + random_part(dt_prop, cal_psi)
+        den <- bi_den + (-nrow(dt_cur)/2*log(det(cal_psi))) + random_part(dt_cur, cal_psi)
+        
+        a<-min(num-den,log(1)) 
+        u <- log(runif(1)) 
+        
+        if(u <=  a){
+          b_i[l,i,h] <- bi_prop
+        }else{
+          b_i[l,i,h] <- bi_cur
+        }
+      }
+      
+      #새롭게 update된 random effect를 기존의 dataset과 결합 
+      delta_id <- cbind(unique(s_id), (b_i[,i,h]))
+      dt_apply$`2` <- delta_id[,2][match(dt_apply$id, delta_id$id)]
+
+      pb$tick() #진행률 업데이트 
+    }
+  }
+  
+  #결과 저장 
+  pm <- list(alpha = alpha, beta= beta, k=k, Omega=Omega, Rho=Rho, Sigma_1=Sigma_1, Sigma_2=Sigma_2)
+  file_name <- paste0("pm_",20*(name-1)+n,".RData")
+  save(pm,file=file_name)
+  
+  #Acceptance rate 
+  cat('\n')
+  cat("<Overall Acceptance Rate>",'\n')
+  cat("Alpha :", accept_a/n.iter, '\n')
+  cat("Beta :", accept_b/n.iter, '\n')
+  cat("K :", accept_k/n.iter, '\n')
+  cat("Omega :", accept_Omega/n.iter, '\n')
+  cat("Sigma_1 :", accept_Sigma_1/n.iter, '\n')
+  cat("Sigma_2 :", accept_Sigma_2/n.iter, '\n')
+  
+  #Posterior mean
+  cat('\n')
+  cat("<Posterior mean>",'\n')
+  cat("Alpha :",mean(alpha[,(n.iter/2+1):n.iter,1],na.rm=T), '\n')
+  cat("Beta :",mean(beta[,(n.iter/2+1):n.iter,1],na.rm=T), '\n')
+  cat("K :",mean(k[(n.iter/2+1):n.iter,1],na.rm=T), '\n')
+  cat("Rho :",mean(Rho[(n.iter/2+1):n.iter,1],na.rm=T), '\n')
+  cat("Sigma_1 :",mean(Sigma_1[(n.iter/2+1):n.iter,1],na.rm=T), '\n')
+  cat("Sigma_2 :",mean(Sigma_2[(n.iter/2+1):n.iter,1],na.rm=T), '\n')
+}
+```
+
+#2. PM 저장 (xlsx.)
+```{r}
+n_pm <- 200
+dt_pm <- data.frame(alpha = numeric(),
+                    beta = numeric(),
+                    k = numeric(),
+                    Omega = numeric(),
+                    Rho = numeric(),
+                    Sigma_1 = numeric(),
+                    Sigma_2 = numeric())#빈 데이터 프레임 생성 
+
+for (i in c(1:n_pm)){
+  name_pm <- paste0("pm_",i,".RData")
+  load(name_pm) #저장된 .RData 불러오기 
+  
+  tmp_alpha <- mean(pm$alpha[,(n.iter/2+1):n.iter,1],na.rm=T)
+  tmp_beta <- mean(pm$beta[,(n.iter/2+1):n.iter,1],na.rm=T)
+  tmp_k <- mean(pm$k[(n.iter/2+1):n.iter,1],na.rm=T)
+   
+  tmp_Omega <- mean(pm$Omega[,(n.iter/2+1):n.iter,1],na.rm=T)
+  tmp_Rho <- mean(pm$Rho[(n.iter/2+1):n.iter,1],na.rm=T)
+  tmp_Sigma_1 <- mean(pm$Sigma_1[(n.iter/2+1):n.iter,1],na.rm=T)
+  tmp_Sigma_2 <- mean(pm$Sigma_2[(n.iter/2+1):n.iter,1],na.rm=T)
+  
+  tmp_dt <- data.frame(alpha= tmp_alpha, beta = tmp_beta, k= tmp_k,
+                       Omega = tmp_Omega,
+                       Rho= tmp_Rho, Sigma_1 = tmp_Sigma_1, Sigma_2 = tmp_Sigma_2)
+  
+  dt_pm <- rbind(dt_pm, tmp_dt)
+}
+
+#정리된 dt 저장 
+write_xlsx(dt_pm, "pm_dt.xlsx")
+```
+
+##a. pm계산
+```{r}
+mean(dt_pm$alpha)
+mean(dt_pm$beta)
+mean(dt_pm$k)
+mean(dt_pm$Rho)
+mean(dt_pm$Sigma_1)
+mean(dt_pm$Sigma_2)
+```
+
+#3. Bias, MSE 계산 
+
+##a. Bias 
+```{r}
+dt_pm <-read_xlsx("pm_dt.xlsx")
+
+t_alpha[1] - sum(dt_pm$alpha)/n_pm #alpha
+t_beta[1]  - sum(dt_pm$beta)/n_pm #beta
+t_k  - sum(dt_pm$k)/n_pm #k 
+
+t_Sigma_1 - sum(dt_pm$Sigma_1)/n_pm #sigma_1
+t_Sigma_2 - sum(dt_pm$Sigma_2)/n_pm#sigma_2
+t_Rho - sum(dt_pm$Rho)/n_pm #rho
+```
+
+##b. Relative Bias 
+```{r}
+(sum(dt_pm$alpha)/n_pm-t_alpha[1])/t_alpha[1]*100 #alpha
+(sum(dt_pm$beta)/n_pm-t_beta[1])/t_beta[1]*100 #beta
+(sum(dt_pm$k)/n_pm-t_k)/t_k*100 #k
+(sum(dt_pm$Sigma_1)/n_pm-t_Sigma_1)/t_Sigma_1*100 #Sigma_1
+(sum(dt_pm$Sigma_2)/n_pm-t_Sigma_2)/t_Sigma_2*100 #Sigma_2
+(sum(dt_pm$Rho)/n_pm-t_Rho)/t_Rho*100 #Rho
+```
+
+##c. MSE 
+```{r}
+sum((t_alpha[1] - dt_pm$alpha)^2)/n_pm #alpha
+sum((t_beta[1] - dt_pm$beta)^2)/n_pm #beta
+sum((t_k - dt_pm$k)^2)/n_pm #k 
+
+sum((t_Sigma_1 - dt_pm$Sigma_1)^2)/n_pm #Sigma_1 
+sum((t_Sigma_2 - dt_pm$Sigma_2)^2)/n_pm #Sigma_2
+sum((t_Rho - dt_pm$Rho)^2)/n_pm #Rho
+``` 
+
+##e.Gelman-Rubin test 진행하기 
+
+```{r}
+chain=NULL
+for(i in c(1:n_pm)){
+  load(paste0("pm_",i,".RData"))
+  chain <- cbind(chain, pm$Rho[1:n.iter,1] ) 
+}
+m=n_pm ; n=10000
+
+#W 
+W=mean(apply(chain,2,var))
+
+#B
+mean_A <- mean(chain)
+B=var(apply(chain,2,mean))*n
+
+#V
+V=((n-1)/n)*W+B/n
+
+#R
+sqrt(V/W)
+
+#alpha : 1.14
+#beta :1.22
+#k : 1.03
+#Sigma_1 : 1.34
+#Sigma_2 :1.14
+#Rho  : 1.85
+``` 
+
+#4. 비교모형 (ZINB 모형)
+```{r}
+library(TMB)
+library(glmmTMB)
+```
+
+##a. 동일한 200개의 dataset에 적용
+```{r, warnings=F}
+compare_zinb_results <- data.frame(alpha=numeric(), beta=numeric(), 
+                                   k=numeric(), 
+                                   Sigma_1 = numeric(), Sigma_2= numeric())
+
+for(i in c(1:n_pm)){
+  #데이터 불러오기
+  simul_data <- read_excel(paste0("simul_data_",i,".xlsx"))
+  simul_data$Y_12 <- ifelse(simul_data$Y_trans%in%target_trans, 0,
+                            simul_data$Y_trans)
+
+  #Model 적용 
+  compare_zinb <- glmmTMB(
+    Y_12 ~  -1+Xb_1+(0+Zb_1|id),      
+    ziformula = ~ -1+Xa_1+(0+Za_1|id),               
+    family = nbinom2,              
+    data = simul_data
+  )
+  
+  #추정된 parameter결과 저장 
+  z_alpha <- -as.numeric(compare_zinb$sdr$par.fixed[2])
+  z_beta <- as.numeric(compare_zinb$sdr$par.fixed[1])
+  z_k <- sigma(compare_zinb)
+  
+  var <- VarCorr(compare_zinb)
+  z_Sigma_1 <- sqrt(var$zi$id[1]) #Sigma_1^2
+  z_Sigma_2 <- sqrt(var$cond$id[1]) #Sigma_2^2
+  
+  compare_zinb_results <- rbind(compare_zinb_results, 
+                                data.frame(alpha= z_alpha,
+                                           beta = z_beta,
+                                           k= z_k,
+                                           Sigma_1 = z_Sigma_1,
+                                           Sigma_2 = z_Sigma_2))
+  
+}
+
+```
+
+```{r}
+#PM 산출
+mean(compare_zinb_results$alpha)
+mean(compare_zinb_results$beta)
+mean(compare_zinb_results$k)
+mean(compare_zinb_results$Sigma_1)
+mean(compare_zinb_results$Sigma_2)
+```
+
+##b.Bias
+```{r}
+t_alpha[1] - sum(compare_zinb_results$alpha)/n_pm #alpha
+t_beta[1] - sum(compare_zinb_results$beta)/n_pm #beta
+t_k - sum(compare_zinb_results$k)/n_pm #k 
+
+t_Sigma_1 - sum(compare_zinb_results$Sigma_1)/n_pm #sigma_1
+t_Sigma_2 - sum(compare_zinb_results$Sigma_2)/n_pm #sigma_2
+```
+
+##c. Relative Bias 
+```{r}
+(sum(compare_zinb_results$alpha)/n_pm-t_alpha[1])/t_alpha[1]*100 #alpha
+(sum(compare_zinb_results$beta)/n_pm-t_beta[1])/t_beta[1]*100 #beta
+(sum(compare_zinb_results$k)/n_pm-t_k)/t_k*100 #k
+
+(sum(compare_zinb_results$Sigma_1)/n_pm-t_Sigma_1)/t_Sigma_1*100 #Sigma_1
+(sum(compare_zinb_results$Sigma_2)/n_pm-t_Sigma_2)/t_Sigma_2*100 #Sigma_2
+```
+
+##d.MSE
+```{r}
+sum((t_alpha[1] - compare_zinb_results$alpha)^2)/n_pm #alpha
+sum((t_beta[1] - compare_zinb_results$beta)^2)/n_pm #beta
+sum((t_k - compare_zinb_results$k)^2)/n_pm #k 
+
+sum((t_Sigma_1 - compare_zinb_results$Sigma_1)^2)/n_pm #Sigma_1 
+sum((t_Sigma_2 - compare_zinb_results$Sigma_2)^2)/n_pm #Sigma_2
+```
+
+#5.비교모형2 (hurdle model)
+```{r}
+library(pscl)
+library(lme4)
+```
+
+##a.동일한 200개의 데이터 적용
+```{r}
+compare_hurdle_results <- data.frame(alpha=numeric(), beta=numeric(), 
+                                   Sigma_1 = numeric(), Sigma_2= numeric())
+
+for(i in c(1:n_pm)){
+  #데이터 불러오기
+  med_target <- median(target_trans)
+  
+  simul_data <- read_excel(paste0("simul_data_",i,".xlsx"))
+  simul_data$Y_comb <- ifelse(simul_data$Y_trans%in%target_trans, med_target, simul_data$Y_trans)
+
+  model_prob <- glmer(I(Y_comb == med_target) ~ -1 + Xa_1 + (0+Za_1|id), family = binomial(link="logit"), data = simul_data)
+  
+  model_count <- glmer(Y_comb ~ -1 + Xb_1 + (0+Zb_1 | id), family = negative.binomial(1), data = simul_data[simul_data$Y_comb != med_target, ])
+  
+  #추정된 parameter결과 저장 
+  h_alpha <- -as.numeric(fixef(model_prob))
+  h_beta <- as.numeric(fixef(model_count))
+  
+  h_Sigma_1 <- sqrt(VarCorr(model_prob)$id[1])#Sigma_1
+  h_Sigma_2 <- sqrt(VarCorr(model_count)$id[1])#Sigma_1
+  
+  compare_hurdle_results <- rbind(compare_hurdle_results, 
+                                data.frame(alpha= h_alpha,
+                                           beta = h_beta,
+                                           Sigma_1 = h_Sigma_1,
+                                           Sigma_2 = h_Sigma_2))
+  
+}
+```
+
+```{r}
+#PM 산출 
+mean(compare_hurdle_results$alpha)
+mean(compare_hurdle_results$beta)
+mean(compare_hurdle_results$Sigma_1)
+mean(compare_hurdle_results$Sigma_2)
+```
+
+##b.Bias
+```{r}
+t_alpha[1] - sum(compare_hurdle_results$alpha)/n_pm #alpha
+t_beta[1] - sum(compare_hurdle_results$beta)/n_pm #beta
+
+t_Sigma_1 - sum(compare_hurdle_results$Sigma_1)/n_pm #sigma_1
+t_Sigma_2 - sum(compare_hurdle_results$Sigma_2)/n_pm #sigma_2
+```
+
+##c. Relative Bias 
+```{r}
+(sum(compare_hurdle_results$alpha)/n_pm-t_alpha[1])/t_alpha[1]*100 #alpha
+(sum(compare_hurdle_results$beta)/n_pm-t_beta[1])/t_beta[1]*100 #beta
+
+(sum(compare_hurdle_results$Sigma_1)/n_pm-t_Sigma_1)/t_Sigma_1*100 #Sigma_1
+(sum(compare_hurdle_results$Sigma_2)/n_pm-t_Sigma_2)/t_Sigma_2*100 #Sigma_2
+```
+
+##c.MSE
+```{r}
+sum((t_alpha[1] - compare_hurdle_results$alpha)^2)/n_pm #alpha
+sum((t_beta[1] - compare_hurdle_results$beta)^2)/n_pm #beta
+
+sum((t_Simga_1 - compare_hurdle_results$Sigma_1)^2)/n_pm #Sigma_1 
+sum((t_Sigma_2 - compare_hurdle_results$Sigma_2)^2)/n_pm #Sigma_2
+```
+
+#6. 모의데이터 분포 시각화 
+```{R}
+sample_data<- read_excel("simul_data_82.xlsx")
+
+# var == 1인 행만 필터링
+var_1_rows <- which(sample_data$Y_trans == 1)
+rows_to_exclude <- sample(var_1_rows, size = 20)
+sample_data <- sample_data[-rows_to_exclude, ]
+
+pic<-sample_data %>% filter(Y_trans<=50) %>% ggplot(aes(x=Y_trans))+geom_bar()+theme_bw()+labs(x = "Response Variable") 
+
+ggsave("simul_80.jpg", plot = pic, width = 6, height = 4, dpi = 300)
+```
